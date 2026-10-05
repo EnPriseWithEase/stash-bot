@@ -1,3 +1,21 @@
+/*
+**    Stash, a UCI chess playing engine developed from scratch
+**    Copyright (C) 2019-2025 Morgan Houppin
+**
+**    Stash is free software: you can redistribute it and/or modify
+**    it under the terms of the GNU General Public License as published by
+**    the Free Software Foundation, either version 3 of the License, or
+**    (at your option) any later version.
+**
+**    Stash is distributed in the hope that it will be useful,
+**    but WITHOUT ANY WARRANTY; without even the implied warranty of
+**    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+**    GNU General Public License for more details.
+**
+**    You should have received a copy of the GNU General Public License
+**    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 #include "worker.h"
 
 #include <stdio.h>
@@ -68,7 +86,7 @@ void sort_root_moves(RootMove *root_moves, usize root_count) {
 }
 
 void worker_init(Worker *worker, usize thread_index, struct WorkerPool *pool) {
-    memset(&worker->board, 0, sizeof(Board)); // Fix: Ensure worker->board.stack is NULL initially
+    memset(&worker->board, 0, sizeof(Board));
     worker->thread_index = thread_index;
     worker->butterfly_hist = wrap_aligned_alloc(64, sizeof(ButterflyHistory));
     worker->continuation_hist = wrap_aligned_alloc(64, sizeof(ContinuationHistory));
@@ -290,6 +308,11 @@ void wpool_start_search(
     }
     board_clone(&wpool->root_board, root_board);
     search_params_copy(&wpool->search_params, search_params);
+
+    // Populate searchmoves with legal moves if none were passed by UCI command
+    if (movelist_size(&wpool->search_params.searchmoves) == 0) {
+        board_generate_moves(&wpool->root_board, &wpool->search_params.searchmoves);
+    }
 
     for (usize i = 0; i < wpool->worker_count; ++i) {
         worker_init_search_data(wpool->worker_list[i]);

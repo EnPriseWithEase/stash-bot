@@ -1,7 +1,28 @@
+/*
+**    Stash, a UCI chess playing engine developed from scratch
+**    Copyright (C) 2019-2025 Morgan Houppin
+**
+**    Stash is free software: you can redistribute it and/or modify
+**    it under the terms of the GNU General Public License as published by
+**    the Free Software Foundation, either version 3 of the License, or
+**    (at your option) any later version.
+**
+**    Stash is distributed in the hope that it will be useful,
+**    but WITHOUT ANY WARRANTY; without even the implied warranty of
+**    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+**    GNU General Public License for more details.
+**
+**    You should have received a copy of the GNU General Public License
+**    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <stdio.h>
+
 #include "search.h"
 #include "board.h"
 #include "evaluate.h"
 #include "movepicker.h"
+#include "strmanip.h"
 #include "tt.h"
 
 // Piece values used for pure material calculations and futility margins
@@ -20,27 +41,22 @@ Score qsearch(bool pv_node, Board *board, Score alpha, Score beta, Searchstack *
     const Score old_alpha = alpha;
     Movepicker mp;
 
-    // Verify time usage if we are the main thread.
     if (worker->thread_index == 0) {
         wpool_check_time(worker->pool);
     }
 
-    // Update seldepth if needed.
     if (pv_node) {
         worker->seldepth = u16_max(worker->seldepth, ss->plies + 1);
     }
 
-    // Stop search if the game is drawn or search is stopped.
     if (wpool_is_stopped(worker->pool) || board_game_is_drawn(board, ss->plies)) {
         return worker_draw_score(worker);
     }
 
-    // Stop search at MAX_PLIES limit.
     if (ss->plies >= MAX_PLIES) {
         return !board->stack->checkers ? evaluate(board) : worker_draw_score(worker);
     }
 
-    // Mate distance pruning
     alpha = i16_max(alpha, mated_in(ss->plies));
     beta = i16_min(beta, mate_in(ss->plies + 1));
 
@@ -56,7 +72,6 @@ Score qsearch(bool pv_node, Board *board, Score alpha, Score beta, Searchstack *
 
     tt_entry = tt_probe(&worker->pool->tt, board->stack->board_key, &tt_found);
 
-    // Probe the Transposition Table.
     if (tt_found) {
         tt_score = score_from_tt(tt_entry->score, ss->plies);
         tt_bound = tt_entry_bound(tt_entry);
@@ -90,7 +105,6 @@ Score qsearch(bool pv_node, Board *board, Score alpha, Score beta, Searchstack *
             eval = best_score = raw_eval;
         }
 
-        // Stand Pat: allow direct cutoffs if static eval already beats beta.
         alpha = (Score)i16_max(alpha, best_score);
 
         if (alpha >= beta) {
@@ -132,7 +146,6 @@ Score qsearch(bool pv_node, Board *board, Score alpha, Score beta, Searchstack *
         ++move_count;
         const bool gives_check = board_move_gives_check(board, currmove);
 
-        // Material Futility Pruning
         if (best_score > -MATE_FOUND && futility_ok && !gives_check
             && move_type(currmove) == NORMAL_MOVE) {
 
@@ -232,7 +245,6 @@ Score search(bool root_node, bool pv_node, Board *board, Score alpha, Score beta
         return qsearch(pv_node, board, alpha, beta, ss);
     }
 
-    // Mate Distance Pruning
     alpha = i16_max(alpha, mated_in(ss->plies));
     beta = i16_min(beta, mate_in(ss->plies + 1));
     if (alpha >= beta) {
@@ -321,7 +333,6 @@ Score search(bool root_node, bool pv_node, Board *board, Score alpha, Score beta
         if (move_count == 1) {
             score = -search(false, pv_node, board, -beta, -alpha, depth - 1, ss + 1, NO_MOVE);
         } else {
-            // PVS / LMR search
             i16 reduction = (move_count > 3 && depth >= 3 && !is_noisy && !gives_check) ? 1 : 0;
             score = -search(false, false, board, -alpha - 1, -alpha, depth - 1 - reduction, ss + 1, NO_MOVE);
 
@@ -391,7 +402,7 @@ Score search(bool root_node, bool pv_node, Board *board, Score alpha, Score beta
 /* ========================================================================== */
 
 void search_init(void) {
-    // Basic search setup if needed.
+    // Search initialization routines
 }
 
 void main_worker_search(Worker *worker) {
@@ -405,9 +416,14 @@ void main_worker_search(Worker *worker) {
     }
 
     worker->seldepth = 0;
-    
+
+    const u16 target_depth = worker->pool->search_params.depth > 0
+        ? (u16)worker->pool->search_params.depth
+        : MAX_PLIES;
+
     // Iterative Deepening Search Loop
-    for (i16 depth = 1; depth <= MAX_PLIES; ++depth) {
+    for (i16 depth = 1; depth <= target_depth; ++depth) {
+        worker->root_depth = depth;
         Score score = search(true, true, &worker->board, -INF_SCORE, INF_SCORE, depth, &stack[0], NO_MOVE);
 
         if (wpool_is_stopped(worker->pool)) {
@@ -416,6 +432,20 @@ void main_worker_search(Worker *worker) {
 
         (void)score;
     }
+
+    wpool_stop(worker->pool);
+
+    // Retrieve bestmove and print to stdout
+    Move best_move = NO_MOVE;
+    if (worker->root_move_count > 0) {
+        best_move = worker->root_moves[0].move;
+    } else if (stack[0].pv.length > 0) {
+        best_move = stack[0].pv.moves[0];
+    }
+
+    StringView move_sv = board_move_to_uci(&worker->board, best_move);
+    printf("bestmove %.*s\n", (int)move_sv.size, move_sv.data);
+    fflush(stdout);
 }
 
 void worker_search(Worker *worker) {
@@ -428,8 +458,13 @@ void worker_search(Worker *worker) {
         pv_line_init(&stack[i].pv);
     }
 
+    const u16 target_depth = worker->pool->search_params.depth > 0
+        ? (u16)worker->pool->search_params.depth
+        : MAX_PLIES;
+
     // Helper Thread Iterative Deepening Loop
-    for (i16 depth = 1; depth <= MAX_PLIES; ++depth) {
+    for (i16 depth = 1; depth <= target_depth; ++depth) {
+        worker->root_depth = depth;
         search(true, false, &worker->board, -INF_SCORE, INF_SCORE, depth, &stack[0], NO_MOVE);
 
         if (wpool_is_stopped(worker->pool)) {
