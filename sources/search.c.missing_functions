@@ -1,0 +1,518 @@
+#include "search.h"
+#include "board.h"
+#include "evaluate.h"
+#include "history.h"
+#include "movepicker.h"
+#include "tt.h"
+
+// Piece values used for pure material calculations and futility margins
+static const Score MaterialValue[7] = {
+    0,     // NO_PIECE_TYPE
+    100,   // PAWN
+    300,   // KNIGHT
+    300,   // BISHOP
+    500,   // ROOK
+    900,   // QUEEN
+    0      // KING
+};
+
+void update_continuation_histories(
+    Searchstack *ss,
+    i16 depth,
+    Piece piece,
+    Square to,
+    bool fail_high
+) {
+    i16 bonus = history_bonus(depth);
+    i32 conthist_score = 0;
+
+    if (!fail_high) {
+        bonus = -bonus;
+    }
+
+    conthist_score += piece_hist_score((ss - 1)->piece_history, piece, to);
+    conthist_score += piece_hist_score((ss - 2)->piece_history, piece, to);
+    conthist_score += piece_hist_score((ss - 4)->piece_history, piece, to);
+    conthist_score /= 3;
+
+    piece_hist_update((ss - 1)->piece_history, piece, to, (i16)conthist_score, bonus);
+    piece_hist_update((ss - 2)->piece_history, piece, to, (i16)conthist_score, bonus);
+    piece_hist_update((ss - 4)->piece_history, piece, to, (i16)conthist_score, bonus);
+}
+
+void update_quiet_history(
+    const Board *board,
+    i16 depth,
+    Move bestmove,
+    const Move *tried_quiets,
+    i16 quiet_count,
+    Searchstack *ss
+) {
+    Worker *worker = board_get_worker(board);
+    const i16 bonus = history_bonus(depth);
+    const Move previous_move = (ss - 1)->current_move;
+    Piece moved_piece = board_moved_piece(board, bestmove);
+    Square to = move_to(bestmove);
+
+    // Apply history bonuses to the bestmove.
+    if ((ss - 1)->piece_history != NULL) {
+        const Square last_to = move_to(previous_move);
+        const Piece last_piece = board_piece_on(board, last_to);
+
+        worker->counter_hist->data[last_piece][last_to] = bestmove;
+    }
+
+    butterfly_hist_update(worker->butterfly_hist, moved_piece, bestmove, bonus);
+    update_continuation_histories(ss, depth, moved_piece, to, true);
+
+    // Set the bestmove as a killer.
+    ss->killer = bestmove;
+
+    // Apply history penalties to all previous failing quiet moves.
+    for (i16 i = 0; i < quiet_count; ++i) {
+        moved_piece = board_moved_piece(board, tried_quiets[i]);
+        to = move_to(tried_quiets[i]);
+        butterfly_hist_update(worker->butterfly_hist, moved_piece, tried_quiets[i], -bonus);
+        update_continuation_histories(ss, depth, moved_piece, to, false);
+    }
+}
+
+static void update_single_capture(CaptureHistory *capture_hist, const Board *board, Move move, i16 bonus) {
+    const Piece moved_piece = board_moved_piece(board, move);
+    const Square to = move_to(move);
+    const Piecetype captured = (move_type(move) == PROMOTION) ? move_promotion_type(move)
+        : (move_type(move) == EN_PASSANT)                     ? PAWN
+                                                              : piece_type(board_piece_on(board, to));
+
+    capture_hist_update(capture_hist, moved_piece, to, captured, bonus);
+}
+
+void update_capture_history(
+    const Board *board,
+    i16 depth,
+    Move bestmove,
+    const Move *tried_noisy,
+    i16 noisy_count,
+    __attribute__((unused)) Searchstack *ss
+) {
+    CaptureHistory *capture_hist = board_get_worker(board)->capture_hist;
+    const i16 bonus = history_bonus(depth);
+
+    // Apply history bonuses to the bestmove.
+    if (board_move_is_noisy(board, bestmove)) {
+        update_single_capture(capture_hist, board, bestmove, bonus);
+    }
+
+    // Apply history penalties to all previous failing capture moves.
+    for (i16 i = 0; i < noisy_count; ++i) {
+        update_single_capture(capture_hist, board, tried_noisy[i], -bonus);
+    }
+}
+
+Score qsearch(bool pv_node, Board *board, Score alpha, Score beta, Searchstack *ss) {
+    Worker *worker = board_get_worker(board);
+    const Score old_alpha = alpha;
+    Movepicker mp;
+
+    // Verify the time usage if we're the main thread.
+    if (worker->thread_index == 0) {
+        wpool_check_time(worker->pool);
+    }
+
+    // Update the seldepth value if needed.
+    if (pv_node) {
+        worker->seldepth = u16_max(worker->seldepth, ss->plies + 1);
+    }
+
+    // Stop the search if the game is drawn or the timeman/UCI thread asks for a stop.
+    if (wpool_is_stopped(worker->pool) || board_game_is_drawn(board, ss->plies)) {
+        return worker_draw_score(worker);
+    }
+
+    // Stop the search after MAX_PLIES recursive search calls.
+    if (ss->plies >= MAX_PLIES) {
+        return !board->stack->checkers ? evaluate(board) : worker_draw_score(worker);
+    }
+
+    // Mate distance pruning
+    alpha = i16_max(alpha, mated_in(ss->plies));
+    beta = i16_min(beta, mate_in(ss->plies + 1));
+
+    if (alpha >= beta) {
+        return alpha;
+    }
+
+    Score tt_score = NO_SCORE;
+    Bound tt_bound = NO_BOUND;
+    Move tt_move = NO_MOVE;
+    bool tt_found;
+    TranspositionEntry *tt_entry;
+
+    tt_entry = tt_probe(&worker->pool->tt, board->stack->board_key, &tt_found);
+
+    // Probe the TT for information on the current position.
+    if (tt_found) {
+        tt_score = score_from_tt(tt_entry->score, ss->plies);
+        tt_bound = tt_entry_bound(tt_entry);
+        tt_move = tt_entry->bestmove;
+
+        // Check if we can directly return a score for non-PV nodes.
+        if (!pv_node
+            && (((tt_bound & LOWER_BOUND) && tt_score >= beta)
+                || ((tt_bound & UPPER_BOUND) && tt_score <= alpha))) {
+            return tt_score;
+        }
+    }
+
+    const bool in_check = !!board->stack->checkers;
+    Score raw_eval;
+    Score eval;
+    Score best_score;
+
+    // Don't compute the eval while in check.
+    if (in_check) {
+        raw_eval = eval = NO_SCORE;
+        best_score = -INF_SCORE;
+    } else {
+        // Use the TT stored information for getting an eval or compute material evaluation directly.
+        if (tt_found) {
+            raw_eval = tt_entry->eval;
+            eval = best_score = raw_eval;
+
+            // Try to use the TT score as a better evaluation of the position.
+            if (tt_bound & (tt_score > best_score ? LOWER_BOUND : UPPER_BOUND)) {
+                best_score = tt_score;
+            }
+        }
+        // Call pure material evaluation function otherwise.
+        else {
+            raw_eval = evaluate(board);
+            eval = best_score = raw_eval;
+        }
+
+        // Stand Pat: If not playing a capture is better because of superior static balance, allow direct return.
+        alpha = (Score)i16_max(alpha, best_score);
+
+        if (alpha >= beta) {
+            // Save the eval in TT so that other workers won't have to recompute it.
+            if (!tt_found) {
+                tt_save(
+                    &worker->pool->tt,
+                    tt_entry,
+                    board->stack->board_key,
+                    score_to_tt(best_score, ss->plies),
+                    raw_eval,
+                    0,
+                    LOWER_BOUND,
+                    NO_MOVE
+                );
+            }
+
+            return alpha;
+        }
+    }
+
+    movepicker_init(&mp, true, board, worker, tt_move, ss);
+
+    Move currmove;
+    Move bestmove = NO_MOVE;
+    i16 move_count = 0;
+    Boardstack stack;
+
+    // Material-based futility pruning setup
+    const bool futility_ok = !in_check && board_total_piece_count(board) >= 5;
+    const Score futility_base = best_score + 200; // Delta margin for tactical safety
+
+    while ((currmove = movepicker_next_move(&mp, false, 0)) != NO_MOVE) {
+        // Only analyze good noisy moves.
+        if (best_score > -MATE_FOUND && mp.stage == PICK_BAD_NOISY) {
+            break;
+        }
+
+        if (!board_move_is_legal(board, currmove)) {
+            continue;
+        }
+
+        ++move_count;
+
+        const bool gives_check = board_move_gives_check(board, currmove);
+
+        // Material Futility Pruning
+        if (best_score > -MATE_FOUND && futility_ok && !gives_check
+            && move_type(currmove) == NORMAL_MOVE) {
+            
+            Piecetype captured_type = piece_type(board_piece_on(board, move_to(currmove)));
+            const Score futility_value = futility_base + MaterialValue[captured_type];
+
+            // Check if the move is unlikely to improve alpha even with captured material gain.
+            if (futility_value < alpha) {
+                best_score = i16_max(best_score, futility_value);
+                continue;
+            }
+
+            // If static eval is far below alpha, only search moves that win material.
+            if (futility_base < alpha && !board_see_above(board, currmove, 1)) {
+                best_score = i16_max(best_score, futility_base);
+                continue;
+            }
+        }
+
+        // Save history state for sub-nodes.
+        ss->current_move = currmove;
+        ss->piece_history =
+            &worker->continuation_hist
+                 ->piece_history[board_moved_piece(board, currmove)][move_to(currmove)];
+
+        if (pv_node) {
+            pv_line_init(&ss->pv);
+        }
+
+        board_do_move_gc(board, currmove, &stack, gives_check);
+        prefetch(tt_entry_at(&worker->pool->tt, board->stack->board_key));
+        worker_increment_nodes(worker);
+
+        Score score = -qsearch(pv_node, board, -beta, -alpha, ss + 1);
+
+        board_undo_move(board, currmove);
+
+        // Check for search interruption.
+        if (wpool_is_stopped(worker->pool)) {
+            return 0;
+        }
+
+        best_score = (Score)i16_max(best_score, score);
+
+        // Check if score beats alpha.
+        if (alpha < best_score) {
+            alpha = best_score;
+            bestmove = currmove;
+
+            // Update PV path.
+            if (pv_node) {
+                pv_line_update(&(ss - 1)->pv, bestmove, &ss->pv);
+            }
+
+            // Cutoff check.
+            if (alpha >= beta) {
+                break;
+            }
+        }
+    }
+
+    // Checkmate evaluation
+    if (move_count == 0 && in_check) {
+        best_score = mated_in(ss->plies);
+    }
+
+    Bound bound = (best_score >= beta) ? LOWER_BOUND
+        : (best_score <= old_alpha)    ? UPPER_BOUND
+                                       : EXACT_BOUND;
+
+    tt_save(
+        &worker->pool->tt,
+        tt_entry,
+        board->stack->board_key,
+        score_to_tt(best_score, ss->plies),
+        raw_eval,
+        0,
+        bound,
+        bestmove
+    );
+
+    return best_score;
+}
+
+Score search(bool root_node, bool pv_node, Board *board, Score alpha, Score beta, i16 depth, Searchstack *ss, Move excluded_move) {
+    Worker *worker = board_get_worker(board);
+    const Score old_alpha = alpha;
+    Movepicker mp;
+
+    if (worker->thread_index == 0) {
+        wpool_check_time(worker->pool);
+    }
+
+    if (pv_node) {
+        worker->seldepth = u16_max(worker->seldepth, ss->plies + 1);
+    }
+
+    if (wpool_is_stopped(worker->pool) || board_game_is_drawn(board, ss->plies)) {
+        return worker_draw_score(worker);
+    }
+
+    if (ss->plies >= MAX_PLIES) {
+        return !board->stack->checkers ? evaluate(board) : worker_draw_score(worker);
+    }
+
+    // Quiescence Search at leaf nodes
+    if (depth <= 0) {
+        return qsearch(pv_node, board, alpha, beta, ss);
+    }
+
+    // Mate Distance Pruning
+    alpha = i16_max(alpha, mated_in(ss->plies));
+    beta = i16_min(beta, mate_in(ss->plies + 1));
+    if (alpha >= beta) {
+        return alpha;
+    }
+
+    Score tt_score = NO_SCORE;
+    Bound tt_bound = NO_BOUND;
+    Move tt_move = NO_MOVE;
+    bool tt_found;
+    TranspositionEntry *tt_entry;
+
+    uint64_t key = board->stack->board_key;
+    if (excluded_move != NO_MOVE) {
+        key ^= (uint64_t)excluded_move;
+    }
+
+    tt_entry = tt_probe(&worker->pool->tt, key, &tt_found);
+
+    if (tt_found) {
+        tt_score = score_from_tt(tt_entry->score, ss->plies);
+        tt_bound = tt_entry_bound(tt_entry);
+        tt_move = tt_entry->bestmove;
+
+        if (!pv_node && tt_entry->depth >= depth
+            && (((tt_bound & LOWER_BOUND) && tt_score >= beta)
+                || ((tt_bound & UPPER_BOUND) && tt_score <= alpha))) {
+            return tt_score;
+        }
+    }
+
+    const bool in_check = !!board->stack->checkers;
+    Score raw_eval;
+    Score eval;
+    Score best_score;
+
+    if (in_check) {
+        raw_eval = eval = NO_SCORE;
+        best_score = -INF_SCORE;
+    } else {
+        if (tt_found) {
+            raw_eval = tt_entry->eval;
+            eval = best_score = raw_eval;
+
+            if (tt_bound & (tt_score > best_score ? LOWER_BOUND : UPPER_BOUND)) {
+                best_score = tt_score;
+            }
+        } else {
+            raw_eval = evaluate(board);
+            eval = best_score = raw_eval;
+        }
+    }
+
+    movepicker_init(&mp, false, board, worker, tt_move, ss);
+
+    Move currmove;
+    Move bestmove = NO_MOVE;
+    i16 move_count = 0;
+    i16 quiet_count = 0;
+    i16 noisy_count = 0;
+    Move tried_quiets[64];
+    Move tried_noisy[64];
+    Boardstack stack;
+
+    while ((currmove = movepicker_next_move(&mp, false, depth)) != NO_MOVE) {
+        if (currmove == excluded_move) {
+            continue;
+        }
+
+        if (!board_move_is_legal(board, currmove)) {
+            continue;
+        }
+
+        ++move_count;
+        bool is_noisy = board_move_is_noisy(board, currmove);
+
+        if (is_noisy && noisy_count < 64) {
+            tried_noisy[noisy_count++] = currmove;
+        } else if (!is_noisy && quiet_count < 64) {
+            tried_quiets[quiet_count++] = currmove;
+        }
+
+        const bool gives_check = board_move_gives_check(board, currmove);
+
+        ss->current_move = currmove;
+        ss->piece_history =
+            &worker->continuation_hist
+                 ->piece_history[board_moved_piece(board, currmove)][move_to(currmove)];
+
+        if (pv_node) {
+            pv_line_init(&ss->pv);
+        }
+
+        board_do_move_gc(board, currmove, &stack, gives_check);
+        prefetch(tt_entry_at(&worker->pool->tt, board->stack->board_key));
+        worker_increment_nodes(worker);
+
+        Score score;
+        if (move_count == 1) {
+            score = -search(false, pv_node, board, -beta, -alpha, depth - 1, ss + 1, NO_MOVE);
+        } else {
+            // PVS / LMR search
+            i16 reduction = (move_count > 3 && depth >= 3 && !is_noisy && !gives_check) ? 1 : 0;
+            score = -search(false, false, board, -alpha - 1, -alpha, depth - 1 - reduction, ss + 1, NO_MOVE);
+
+            if (score > alpha && reduction > 0) {
+                score = -search(false, false, board, -alpha - 1, -alpha, depth - 1, ss + 1, NO_MOVE);
+            }
+
+            if (score > alpha && score < beta) {
+                score = -search(false, pv_node, board, -beta, -alpha, depth - 1, ss + 1, NO_MOVE);
+            }
+        }
+
+        board_undo_move(board, currmove);
+
+        if (wpool_is_stopped(worker->pool)) {
+            return 0;
+        }
+
+        best_score = (Score)i16_max(best_score, score);
+
+        if (alpha < best_score) {
+            alpha = best_score;
+            bestmove = currmove;
+
+            if (pv_node) {
+                pv_line_update(&(ss - 1)->pv, bestmove, &ss->pv);
+            }
+
+            if (alpha >= beta) {
+                if (is_noisy) {
+                    update_capture_history(board, depth, bestmove, tried_noisy, noisy_count - 1, ss);
+                } else {
+                    update_quiet_history(board, depth, bestmove, tried_quiets, quiet_count - 1, ss);
+                }
+                break;
+            }
+        }
+    }
+
+    if (move_count == 0) {
+        if (excluded_move != NO_MOVE) {
+            return alpha;
+        }
+        best_score = in_check ? mated_in(ss->plies) : worker_draw_score(worker);
+    }
+
+    Bound bound = (best_score >= beta) ? LOWER_BOUND
+        : (best_score <= old_alpha)    ? UPPER_BOUND
+                                       : EXACT_BOUND;
+
+    if (!root_node || worker->pv_line == 0) {
+        tt_save(
+            &worker->pool->tt,
+            tt_entry,
+            key,
+            score_to_tt(best_score, ss->plies),
+            raw_eval,
+            depth,
+            bound,
+            bestmove
+        );
+    }
+
+    return best_score;
+}
